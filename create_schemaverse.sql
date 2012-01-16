@@ -17,6 +17,39 @@ CREATE SEQUENCE tic_seq
   MAXVALUE 9223372036854775807
   START 1
   CACHE 1;
+  
+CREATE OR REPLACE FUNCTION GET_PLAYER_ID(check_username name) RETURNS integer AS $get_player_id$
+DECLARE 
+	found_player_id integer;
+BEGIN
+	SELECT id INTO found_player_id FROM player WHERE username=check_username;
+	RETURN found_player_id;
+END
+$get_player_id$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION GET_PLAYER_USERNAME(check_player_id integer) RETURNS character varying AS $get_player_username$
+DECLARE 
+	found_username character varying;
+BEGIN
+	SELECT username INTO found_username FROM player WHERE id=check_player_id;
+	RETURN found_username;
+END
+$get_player_username$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+CREATE OR REPLACE FUNCTION GET_PLAYER_ERROR_CHANNEL(player_name character varying default SESSION_USER) RETURNS character varying AS 
+$get_player_error_channel$
+DECLARE 
+	found_error_channel character varying;
+BEGIN
+	IF CURRENT_USER = 'schemaverse' THEN
+		SELECT error_channel INTO found_error_channel FROM player WHERE username=player_name;
+        ELSE
+		SELECT error_channel INTO found_error_channel FROM my_player LIMIT 1;
+	END IF;
+	RETURN found_error_channel;
+END
+$get_player_error_channel$ LANGUAGE plpgsql;
 
 CREATE TABLE variable
 (
@@ -31,7 +64,6 @@ CREATE TABLE variable
 
 CREATE VIEW public_variable AS SELECT * FROM variable WHERE (private='f' AND player_id=0) OR player_id=GET_PLAYER_ID(SESSION_USER);
 
-
 INSERT INTO variable VALUES 
 	('MINE_BASE_FUEL','f',1,'','This value is used as a multiplier for fuel discovered from all planets'::TEXT,0),
 	('UNIVERSE_CREATOR','t',9702000,'','The answer which creates the universe'::TEXT,0), 
@@ -45,9 +77,7 @@ INSERT INTO variable VALUES
 	('ROUND_LENGTH','f',0,'7 days','The length of time a round takes to complete'::TEXT,0),
 	('DEFENSE_EFFICIENCY', 'f', 50, '', 'Used to calculate attack with defense'::TEXT,0);
 
-
-
-
+	
 CREATE OR REPLACE FUNCTION GET_NUMERIC_VARIABLE(variable_name character varying) RETURNS integer AS $get_numeric_variable$
 DECLARE
 	value integer;
@@ -98,8 +128,6 @@ BEGIN
 END $set_char_variable$ SECURITY definer LANGUAGE plpgsql;
 
 
-
-
 CREATE TABLE price_list
 (
 	code character varying NOT NULL PRIMARY KEY,
@@ -119,10 +147,8 @@ INSERT INTO price_list VALUES
 	('DEFENSE', 25, 'Increases a ships DEFENSE by one'),
 	('ENGINEERING', 25, 'Increases a ships ENGINEERING by one'),
 	('PROSPECTING', 25, 'Increases a ships PROSPECTING by one');
-
---no mechanism for updating password yet...
-
-CREATE OR REPLACE FUNCTION GENERATE_STRING(len integer) RETURNS CHARACTER VARYING AS $generate_string$
+	
+	CREATE OR REPLACE FUNCTION GENERATE_STRING(len integer) RETURNS CHARACTER VARYING AS $generate_string$
 BEGIN
 	RETURN array_to_string(ARRAY(SELECT chr((65 + round(random() * 25)) :: integer) FROM generate_series(1,len)), '');
 END
@@ -332,604 +358,7 @@ CREATE TRIGGER ITEM_SCRIPT_UPDATE BEFORE UPDATE ON item
 
 
 
-CREATE OR REPLACE FUNCTION CHARGE(price_code character varying, quantity bigint) RETURNS boolean AS $charge_player$
-DECLARE 
-	amount bigint;
-	current_balance bigint;
-BEGIN
-
-	SELECT cost INTO amount FROM price_list WHERE code=UPPER(price_code);
-	SELECT balance INTO current_balance FROM player WHERE username=SESSION_USER;
-	IF quantity < 0 OR (current_balance - (amount * quantity)) < 0 THEN
-		RETURN 'f';
-	ELSE 
-		UPDATE player SET balance=(balance-(amount * quantity)) WHERE username=SESSION_USER;
-	END IF;
-	RETURN 't'; 
-END
-$charge_player$ LANGUAGE plpgsql SECURITY DEFINER;
-
-
---Never update directly to add inventory. Always INSERT
-CREATE TABLE player_inventory 
-(
-	id integer NOT NULL PRIMARY KEY,
-	player_id integer NOT NULL REFERENCES player(id) DEFAULT GET_PLAYER_ID(SESSION_USER),
-	item character varying NOT NULL REFERENCES item(system_name),
-	quantity integer NOT NULL DEFAULT '1'
-);
-
-CREATE SEQUENCE player_inventory_id_seq
-  INCREMENT 1
-  MINVALUE 1
-  MAXVALUE 9223372036854775807
-  START 1
-  CACHE 1;
-
-CREATE VIEW my_player_inventory AS 
-	SELECT * FROM player_inventory WHERE player_id=GET_PLAYER_ID(SESSION_USER);
-
-
-CREATE OR REPLACE FUNCTION INSERT_ITEM_INTO_INVENTORY() RETURNS trigger AS $insert_item_into_inventory$
-DECLARE
-	inventory_check integer;
-BEGIN
-	SELECT COUNT(*) INTO inventory_check FROM player_inventory WHERE player_id=NEW.player_id and item=NEW.item;
-	IF inventory_check >= 1 THEN
-		UPDATE player_inventory SET quantity=quantity+NEW.quantity WHERE player_id=NEW.player_id and item=NEW.item; 
-		RETURN NULL;
-	END IF;
-	RETURN NEW;
-END
-$insert_item_into_inventory$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER INSERT_ITEM BEFORE INSERT ON player_inventory
-  FOR EACH ROW EXECUTE PROCEDURE INSERT_ITEM_INTO_INVENTORY();  
-
-CREATE OR REPLACE FUNCTION CHECK_PLAYER_INVENTORY() RETURNS trigger AS $check_player_inventory$
-BEGIN
-	IF NEW.quanity = 0 THEN
-		DELETE FROM player_inventory WHERE id = OLD.id;
-	END IF;
-	RETURN NULL;
-END
-$check_player_inventory$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER CHECK_PLAYER_INVENTORY AFTER INSERT OR UPDATE ON player_inventory
-  FOR EACH ROW EXECUTE PROCEDURE CHECK_PLAYER_INVENTORY(); 
-
-CREATE TABLE ship 
-(
-	id integer NOT NULL PRIMARY KEY,
-	player_id integer NOT NULL REFERENCES player(id) DEFAULT GET_PLAYER_ID(SESSION_USER),
-	fleet_id integer,
-	name character varying,
-	last_action_tic integer default '0',
-	last_move_tic integer default '0',
-	last_living_tic integer default '0',
-	current_health integer NOT NULL DEFAULT '100' CHECK (current_health <= max_health),	
-	max_health integer NOT NULL DEFAULT '100',
-	future_health integer default '100',
-	current_fuel integer NOT NULL DEFAULT '1100' CHECK (current_fuel <= max_fuel),
-	max_fuel integer NOT NULL DEFAULT '1100',
-	max_speed integer NOT NULL DEFAULT '1000',
-	range integer NOT NULL DEFAULT '300',
-	attack integer NOT NULL DEFAULT '5',
-	defense integer NOT NULL DEFAULT '5',
-	engineering integer NOT NULL default '5',
-	prospecting integer NOT NULL default '5',
-	location_x integer NOT NULL default 0,
-	location_y integer NOT NULL default 0,
-	destroyed boolean NOT NULL default 'f'
-);
-
-CREATE OR REPLACE FUNCTION GET_SHIP_NAME(ship_id integer) RETURNS character varying AS $get_ship_name$
-DECLARE 
-	found_shipname character varying;
-BEGIN
-	SELECT name INTO found_shipname FROM ship WHERE id=ship_id;
-	RETURN found_shipname;
-END
-$get_ship_name$ LANGUAGE plpgsql SECURITY DEFINER;
-
-
-CREATE TABLE ship_control
-(
-	ship_id integer NOT NULL REFERENCES ship(id) ON DELETE CASCADE,
-	speed integer NOT NULL DEFAULT 0,
-	direction integer NOT NULL  DEFAULT 0 CHECK (0 <= direction and direction <= 360),
-	destination_x integer,
-	destination_y integer,
-	repair_priority integer DEFAULT '0',
-	action character(30) CHECK (action IN ('REPAIR','ATTACK','MINE')),
-	action_target_id integer,
-	PRIMARY KEY (ship_id)
-);
-CREATE SEQUENCE ship_id_seq
-  INCREMENT 1
-  MINVALUE 1
-  MAXVALUE 9223372036854775807
-  START 1
-  CACHE 1;
-
-CREATE TABLE ship_flight_recorder
-(
-  ship_id integer NOT NULL REFERENCES ship(id) ON DELETE CASCADE,
-  tic integer,
-  location_x integer NOT NULL,
-  location_y integer NOT NULL,
-  PRIMARY KEY (ship_id, tic)
-);
-
-CREATE VIEW my_ships_flight_recorder AS
-SELECT 
-  ship_id,
-  tic, 
-  location_x,
-  location_y
-FROM ship_flight_recorder
-WHERE
-  ship_id in (select id from ship where player_id=GET_PLAYER_ID(SESSION_USER));    
-
-
-CREATE VIEW ships_in_range AS
-SELECT 
-	enemies.id as id,
-	players.id as ship_in_range_of,
-	enemies.player_id as player_id,
-	enemies.name as name,
-	enemies.current_health/enemies.max_health as health,
-	--enemies.current_health as current_health,
-	--enemies.max_health as max_health,
-	--enemies.current_fuel as current_fuel,
-	--enemies.max_fuel as max_fuel,
-	--enemies.max_speed as max_speed,
-	--enemies.range as range,
-	--enemies.attack as attack,
-	--enemies.defense as defense,
-	--enemies.engineering as engineering,
-	--enemies.prospecting as prospecting,
-	enemies.location_x as location_x,
-	enemies.location_y as location_y	
-FROM ship enemies, ship players
-WHERE 	
-	enemies.destroyed='f' and players.destroyed='f'
-	AND
-	(
-		players.player_id=GET_PLAYER_ID(SESSION_USER)
-		AND
-		enemies.player_id!=GET_PLAYER_ID(SESSION_USER)
- 	 
-	AND
-	
-		(enemies.location_x between (players.location_x-players.range) and (players.location_x+players.range)) 
-		AND
-		(enemies.location_y between (players.location_y-players.range) and (players.location_y+players.range)) 
-	);
-
-CREATE VIEW my_ships AS 
-SELECT 
-	ship.id as id,
-	ship.fleet_id as fleet_id,
-	ship.player_id as player_id ,
-	ship.name as name,
-	ship.last_action_tic as last_action_tic,
-	ship.last_move_tic as last_move_tic,
-	ship.last_living_tic as last_living_tic,
-	ship.current_health as current_health,
-	ship.max_health as max_health,
-	ship.current_fuel as current_fuel,
-	ship.max_fuel as max_fuel,
-	ship.max_speed as max_speed,
-	ship.range as range,
-	ship.attack as attack,
-	ship.defense as defense,
-	ship.engineering as engineering,
-	ship.prospecting as prospecting,
-	ship.location_x as location_x,
-	ship.location_y as location_y,
-	ship_control.direction as direction,
-	ship_control.speed as speed,
-	ship_control.destination_x as destination_x,
-	ship_control.destination_y as destination_y,
-	ship_control.repair_priority as repair_priority,
-	ship_control.action as action,
-	ship_control.action_target_id as action_target_id
-FROM ship, ship_control 
-WHERE player_id=GET_PLAYER_ID(SESSION_USER) and ship.id=ship_control.ship_id and destroyed='f';
-
-CREATE OR REPLACE RULE ship_insert AS ON INSERT TO my_ships 
-	DO INSTEAD INSERT INTO ship (name, range, attack, defense, engineering, prospecting, location_x, location_y, last_living_tic, fleet_id) 
-		VALUES (new.name, 
-		COALESCE(new.range, 300), 
-		COALESCE(new.attack, 5), 
-		COALESCE(new.defense, 5), 
-		COALESCE(new.engineering, 5), 
-		COALESCE(new.prospecting, 5), 
-		COALESCE(new.location_x::double precision, 0), 
-		COALESCE(new.location_y::double precision, 0), 
-		(( SELECT tic_seq.last_value FROM tic_seq)), 
-		COALESCE(new.fleet_id, NULL::integer))
-  RETURNING ship.id, ship.fleet_id, ship.player_id, ship.name, ship.last_action_tic, ship.last_move_tic, ship.last_living_tic, ship.current_health, ship.max_health, ship.current_fuel, ship.max_fuel, ship.max_speed, 
-ship.range, ship.attack, ship.defense, ship.engineering, ship.prospecting, ship.location_x, ship.location_y, 0, 0, 0, 0, 0,''::CHARACTER(30),0;
-
-
-CREATE OR REPLACE RULE ship_control_update AS ON UPDATE TO my_ships 
-	DO INSTEAD ( 
-		UPDATE ship_control SET 
-			destination_x = new.destination_x, 
-			destination_y = new.destination_y, 
-			repair_priority = new.repair_priority,
-			action = new.action,
-			action_target_id = new.action_target_id
-  		WHERE ship_control.ship_id = new.id;
- 		UPDATE ship SET 
-			name = new.name, 
-			fleet_id = new.fleet_id
-  		WHERE ship.id = new.id;
-);
-
-
-CREATE OR REPLACE FUNCTION CREATE_SHIP() RETURNS trigger AS $create_ship$
-BEGIN
-	--CHECK SHIP STATS
-	NEW.current_health = 100; 
-	NEW.max_health = 100;
-	NEW.current_fuel = 100; 
-	NEW.max_fuel = 100;
-	NEW.max_speed = 1000;
-
-	IF (LEAST(NEW.attack, NEW.defense, NEW.engineering, NEW.prospecting) < 0 ) THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''When creating a new ship, Attack Defense Engineering and Prospecting cannot be values lower than zero'';';
-		RETURN NULL;
-	END IF; 
-
-	IF (NEW.attack + NEW.defense + NEW.engineering + NEW.prospecting) > 20 THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''When creating a new ship, the following must be true (Attack + Defense + Engineering + Prospecting) > 20'';';
-		RETURN NULL;
-	END IF; 
-	
-
-	IF 
---(NOT (NEW.location_x between -3000 and 3000 AND NEW.location_y between -3000 and 3000)) AND
-	(NOT (NEW.location_x = 0 AND NEW.location_y = 0)) AND
-		(SELECT COUNT(id) FROM planets WHERE NEW.location_x=location_x AND NEW.location_y=location_y AND conqueror_id=NEW.player_id) = 0 THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''When creating a new ship, the coordinates must each be between -3000 and 3000 OR be the same as a planet where your player currently holds the conqueror position'';';
-		RETURN NULL;
-	END IF;
-
-	--CHARGE ACCOUNT	
-	IF NOT CHARGE('SHIP', 1) THEN 
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to purchase ship'';';
-		RETURN NULL;
-	END IF;
-	
-	RETURN NEW; 
-END
-$create_ship$ LANGUAGE plpgsql;
-
-CREATE TRIGGER CREATE_SHIP BEFORE INSERT ON ship
-  FOR EACH ROW EXECUTE PROCEDURE CREATE_SHIP(); 
-
-CREATE OR REPLACE FUNCTION CREATE_SHIP_EVENT() RETURNS trigger AS $create_ship_event$
-BEGIN
-	INSERT INTO event(action, player_id_1, ship_id_1, location_x, location_y, public, tic)
-		VALUES('BUY_SHIP',NEW.player_id, NEW.id, NEW.location_x, NEW.location_y, 'f',(SELECT last_value FROM tic_seq));
-	RETURN NULL; 
-END
-$create_ship_event$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER CREATE_SHIP_EVENT AFTER INSERT ON ship
-  FOR EACH ROW EXECUTE PROCEDURE CREATE_SHIP_EVENT(); 
-
-
-CREATE OR REPLACE FUNCTION DESTROY_SHIP() RETURNS trigger AS $destroy_ship$
-BEGIN
-	IF ( NOT OLD.destroyed = NEW.destroyed ) AND NEW.destroyed='t' THEN
-	        --UPDATE player SET balance=balance+(select cost from price_list where code='SHIP') WHERE id=OLD.player_id;
-		
-		INSERT INTO event(action, player_id_1, ship_id_1, location_x, location_y, public, tic)
-			VALUES('EXPLODE',NEW.player_id, NEW.id, NEW.location_x, NEW.location_y, 't',(SELECT last_value FROM tic_seq));
-
-	END IF;
-	RETURN NULL;
-END
-$destroy_ship$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER DESTROY_SHIP AFTER UPDATE ON ship 
- FOR EACH ROW EXECUTE PROCEDURE DESTROY_SHIP();
-
-
-CREATE OR REPLACE FUNCTION CREATE_SHIP_CONTROLLER() RETURNS trigger AS $create_ship_controller$
-BEGIN
-	INSERT INTO ship_control(ship_id) VALUES(NEW.id);
-	RETURN NEW;
-END
-$create_ship_controller$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER CREATE_SHIP_CONTROLLER AFTER INSERT ON ship
-  FOR EACH ROW EXECUTE PROCEDURE CREATE_SHIP_CONTROLLER(); 
-
-
-
-CREATE OR REPLACE FUNCTION SHIP_MOVE_UPDATE() RETURNS trigger AS $ship_move_update$
-BEGIN
-  IF NOT ((NEW.location_x = OLD.location_x) OR (NEW.location_y = OLD.location_y)) THEN
-    INSERT INTO ship_flight_recorder VALUES(NEW.id, (SELECT last_value FROM tic_seq), NEW.location_x, NEW.location_y);
-  END IF;
-  RETURN NULL;
-END $ship_move_update$ LANGUAGE plpgsql SECURITY DEFINER;
-                
-                
-CREATE TRIGGER SHIP_MOVE_UPDATE AFTER UPDATE ON ship
-        FOR EACH ROW EXECUTE PROCEDURE SHIP_MOVE_UPDATE();
-        
-
-CREATE TABLE fleet
-(
-	id integer NOT NULL PRIMARY KEY,
-	player_id integer NOT NULL REFERENCES player(id) DEFAULT GET_PLAYER_ID(SESSION_USER),
-	name character varying(50),
-	script TEXT DEFAULT 'Select 1;'::TEXT,
-	script_declarations TEXT  DEFAULT 'fakevar smallint;'::TEXT,
-	last_script_update_tic integer DEFAULT '0',
-	enabled boolean NOT NULL DEFAULT 'f',
-	runtime interval DEFAULT '00:00:00'::interval 
-);
-
-CREATE SEQUENCE fleet_id_seq
-  INCREMENT 1
-  MINVALUE 1
-  MAXVALUE 9223372036854775807
-  START 1
-  CACHE 1;
-
-ALTER TABLE ship ADD CONSTRAINT fk_ship_fleet FOREIGN KEY (fleet_id) REFERENCES fleet (id) ON DELETE SET NULL;
-
-CREATE VIEW my_fleets AS
-SELECT 
-	id,
-	name,
-	script,
-	script_declarations,
-	last_script_update_tic,
-	enabled,
-	runtime
-FROM 
-	fleet
-WHERE player_id=GET_PLAYER_ID(SESSION_USER);
-
-CREATE RULE fleet_insert AS ON INSERT TO my_fleets
-	DO INSTEAD INSERT INTO fleet(player_id,  name) VALUES(GET_PLAYER_ID(SESSION_USER),  NEW.name);
-
-CREATE RULE fleet_update AS ON UPDATE TO my_fleets 
-	DO INSTEAD UPDATE fleet
-		SET 
-			name=NEW.name,
-			script=NEW.script,
-			script_declarations=NEW.script_declarations,
-			enabled=NEW.enabled
-
-		WHERE id=NEW.id;
-
-CREATE OR REPLACE FUNCTION DISABLE_FLEET(fleet_id integer) RETURNS boolean AS $disable_fleet$
-DECLARE
-BEGIN
-	IF CURRENT_USER = 'schemaverse' THEN
-		UPDATE fleet SET enabled='f' WHERE id=fleet_id;
-	ELSE 
-		UPDATE fleet SET enabled='f' WHERE id=fleet_id  AND player_id=GET_PLAYER_ID(SESSION_USER);
-	END IF;
-	RETURN 't'; 
-END $disable_fleet$  LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION GET_FLEET_RUNTIME(fleet_id integer, username character varying) RETURNS interval AS $get_fleet_runtime$
-DECLARE
-	fleet_runtime interval;
-BEGIN
-	SELECT runtime INTO fleet_runtime FROM fleet WHERE id=fleet_id AND (GET_PLAYER_ID(username)=player_id);
-	RETURN fleet_runtime;
-END 
-$get_fleet_runtime$ LANGUAGE plpgsql SECURITY DEFINER;
-
-
-CREATE OR REPLACE FUNCTION FLEET_SCRIPT_UPDATE() RETURNS trigger AS $fleet_script_update$
-DECLARE
-	player_username character varying;
-	secret character varying;
-	current_tic integer;
-BEGIN
-	IF ((NEW.script = OLD.script) AND (NEW.script_declarations = OLD.script_declarations)) THEN
-		RETURN NEW;
-	END IF;
-
-	SELECT last_value INTO current_tic FROM tic_seq;
-
-	IF NEW.last_script_update_tic = current_tic THEN
-		NEW.script := OLD.script;
-		NEW.script_declarations := OLD.script_declarations;
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Fleet scripts can only be updated once a tic. While you wait why not brush up on your PL/pgSQL skills? '';';
-		RETURN NEW;
-	END IF;
-
-	IF NEW.script LIKE '%$fleet_script_%' OR NEW.script_declarations LIKE '%$fleet_script_%' THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''TILT!'';';
-		RETURN NEW; NEW.last_script_update_tic := current_tic;
-	END IF;
-
-	--secret to stop SQL injections here
-	--Made completely useless by the SETSEED() function within PostgreSQL
-	secret := 'fleet_script_' || (RANDOM()*1000000)::integer;
-	EXECUTE 'CREATE OR REPLACE FUNCTION FLEET_SCRIPT_'|| NEW.id ||'() RETURNS boolean as $'||secret||'$
-	DECLARE
-		this_fleet_id integer;
-		' || NEW.script_declarations || '
-	BEGIN
-		this_fleet_id := '|| NEW.id||';
-		' || NEW.script || '
-		RETURN 1;
-	END $'||secret||'$ LANGUAGE plpgsql;'::TEXT;
-	
-	SELECT GET_PLAYER_USERNAME(player_id) INTO player_username FROM fleet WHERE id=NEW.id;
-	EXECUTE 'REVOKE ALL ON FUNCTION FLEET_SCRIPT_'|| NEW.id ||'() FROM PUBLIC'::TEXT;
-	EXECUTE 'REVOKE ALL ON FUNCTION FLEET_SCRIPT_'|| NEW.id ||'() FROM players'::TEXT;
-	EXECUTE 'GRANT EXECUTE ON FUNCTION FLEET_SCRIPT_'|| NEW.id ||'() TO '|| player_username ||''::TEXT;
-	
-	RETURN NEW;
-END $fleet_script_update$ LANGUAGE plpgsql SECURITY DEFINER;
-
-CREATE TRIGGER FLEET_SCRIPT_UPDATE BEFORE UPDATE ON fleet
-  FOR EACH ROW EXECUTE PROCEDURE FLEET_SCRIPT_UPDATE();  
-
-
-CREATE OR REPLACE FUNCTION REFUEL_SHIP(ship_id integer) RETURNS integer AS $refuel_ship$
-DECLARE
-	current_fuel_reserve integer;
-	new_fuel_reserve integer;
-	
-	current_ship_fuel integer;
-	new_ship_fuel integer;
-	
-	max_ship_fuel integer;
-BEGIN
-
-	SELECT fuel_reserve INTO current_fuel_reserve FROM player WHERE username=SESSION_USER;
-	SELECT current_fuel, max_fuel INTO current_ship_fuel, max_ship_fuel FROM ship WHERE id=ship_id;
-
-	
-	new_fuel_reserve = current_fuel_reserve - (max_ship_fuel - current_ship_fuel);
-	IF new_fuel_reserve < 0 THEN
-		new_ship_fuel = max_ship_fuel - (@new_fuel_reserve);
-		new_fuel_reserve = 0;
-	ELSE
-		new_ship_fuel = max_ship_fuel;
-	END IF;
-	
-	UPDATE ship SET current_fuel=new_ship_fuel WHERE id=ship_id;
-	UPDATE player SET fuel_reserve=new_fuel_reserve WHERE username=SESSION_USER;
-
-	INSERT INTO event(action, player_id_1, ship_id_1, descriptor_numeric, public, tic)
-		VALUES('REFUEL_SHIP',GET_PLAYER_ID(SESSION_USER), ship_id , new_ship_fuel, 'f',(SELECT last_value FROM tic_seq));
-
-	RETURN new_ship_fuel;
-END
-$refuel_ship$ LANGUAGE plpgsql SECURITY DEFINER;
-
-
-
-CREATE OR REPLACE FUNCTION upgrade(reference_id integer, code character varying, quantity integer)
-  RETURNS boolean AS
-$BODY$
-DECLARE 
-
-	ship_value smallint;
-	
-BEGIN
-	IF code = 'SHIP' THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''You cant upgrade ship into ship..Try to insert in my_ships'';';
-		RETURN FALSE;
-	END IF;
-	IF code = 'FLEET_RUNTIME' THEN
-		IF NOT CHARGE(code, quantity) THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to increase fleet runtime'';';
-			RETURN FALSE;
-		END IF;
-	
-		UPDATE fleet SET runtime=runtime + (quantity || ' minute')::interval where id=reference_id;
-
-		INSERT INTO event(action, player_id_1, referencing_id, public, tic)
-			VALUES('FLEET',GET_PLAYER_ID(SESSION_USER), reference_id , 'f',(SELECT last_value FROM tic_seq));
-		RETURN TRUE;
-
-	END IF;
-
-	IF code = 'REFUEL' THEN
-		EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Please use REFUEL_SHIP(ship_id) to refuel a ship now.'';';
-		RETURN FALSE;
-
-	END IF;
-
-
-	IF code = 'RANGE' THEN
-		SELECT range INTO ship_value FROM ship WHERE id=reference_id;
-		IF (ship_value + quantity) > GET_NUMERIC_VARIABLE('MAX_SHIP_RANGE') THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''The range of a ship cannot exceed the MAX_SHIP_RANGE system value of '|| GET_NUMERIC_VARIABLE('MAX_SHIP_RANGE')||''';';
-			RETURN FALSE;
-		ELSE
-			IF NOT CHARGE(code, quantity) THEN
-				EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to perform upgrade'';';
-				RETURN FALSE;
-			END IF;			
-			UPDATE ship SET range=(range+quantity) WHERE id=reference_id ;
-		END IF;
-	ELSEIF code = 'MAX_SPEED' THEN
-		SELECT max_speed INTO ship_value FROM ship WHERE id=reference_id;
-		IF (ship_value + quantity) > GET_NUMERIC_VARIABLE('MAX_SHIP_SPEED') THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''The max speed of a ship cannot exceed the MAX_SHIP_SPEED system value of '|| GET_NUMERIC_VARIABLE('MAX_SHIP_SPEED')||''';';
-			RETURN FALSE;
-		ELSE
-			IF NOT CHARGE(code, quantity) THEN
-				EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to perform upgrade'';';
-				RETURN FALSE;
-			END IF;			
-			UPDATE ship SET max_speed=(max_speed+quantity) WHERE id=reference_id ;
-		END IF;
-	ELSEIF code = 'MAX_HEALTH' THEN
-		SELECT max_health INTO ship_value FROM ship WHERE id=reference_id;
-		IF (ship_value + quantity) > GET_NUMERIC_VARIABLE('MAX_SHIP_HEALTH') THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''The max health of a ship cannot exceed the MAX_SHIP_HEALTH system value of '|| GET_NUMERIC_VARIABLE('MAX_SHIP_HEALTH')||''';';
-			RETURN FALSE;
-		ELSE
-			IF NOT CHARGE(code, quantity) THEN
-				EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to perform upgrade'';';
-				RETURN FALSE;
-			END IF;	
-			UPDATE ship SET max_health=(max_health+quantity) WHERE id=reference_id ;
-		END IF;
-	ELSEIF code = 'MAX_FUEL' THEN
-		SELECT max_fuel INTO ship_value FROM ship WHERE id=reference_id;
-		IF (ship_value + quantity) > GET_NUMERIC_VARIABLE('MAX_SHIP_FUEL') THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''The max fuel of a ship cannot exceed the MAX_SHIP_FUEL system value of '|| GET_NUMERIC_VARIABLE('MAX_SHIP_FUEL')||''';';
-			RETURN FALSE;
-		ELSE
-			IF NOT CHARGE(code, quantity) THEN
-				EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to perform upgrade'';';
-				RETURN FALSE;
-			END IF;	
-			UPDATE ship SET max_fuel=(max_fuel+quantity) WHERE id=reference_id ;
-		END IF;
-	ELSE
-		SELECT (attack+defense+prospecting+engineering) INTO ship_value FROM ship WHERE id=reference_id;
-		IF (ship_value + quantity) > GET_NUMERIC_VARIABLE('MAX_SHIP_SKILL') THEN
-			EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''The total skill of a ship cannot exceed the MAX_SHIP_SKILL system value of '|| GET_NUMERIC_VARIABLE('MAX_SHIP_SKILL')||''';';
-			RETURN FALSE;
-		ELSE
-			IF NOT CHARGE(code, quantity) THEN
-				EXECUTE 'NOTIFY ' || get_player_error_channel() ||', ''Not enough funds to perform upgrade'';';
-				RETURN FALSE;
-			END IF;		
-			IF code = 'ATTACK' THEN
-				UPDATE ship SET attack=(attack+quantity) WHERE id=reference_id ;
-			ELSEIF code = 'DEFENSE' THEN
-				UPDATE ship SET defense=(defense+quantity) WHERE id=reference_id ;
-			ELSEIF code = 'PROSPECTING' THEN
-				UPDATE ship SET prospecting=(prospecting+quantity) WHERE id=reference_id ;
-			ELSEIF code = 'ENGINEERING' THEN
-				UPDATE ship SET engineering=(engineering+quantity) WHERE id=reference_id ;	
-			END IF;
-		END IF;
-	
-	END IF;	
-
-	INSERT INTO event(action, player_id_1, ship_id_1, descriptor_numeric,descriptor_string, public, tic)
-	VALUES('UPGRADE_SHIP',GET_PLAYER_ID(SESSION_USER), reference_id , quantity, code, 'f',(SELECT last_value FROM tic_seq));
-
-	RETURN TRUE;
-END 
-$BODY$
-  LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
-
-CREATE OR REPLACE FUNCTION CONVERT_RESOURCE(current_resource_type character varying, amount integer) RETURNS integer as $convert_resource$
+	CREATE OR REPLACE FUNCTION CONVERT_RESOURCE(current_resource_type character varying, amount integer) RETURNS integer as $convert_resource$
 DECLARE
 	amount_of_new_resource integer;
 	fuel_check integer;
@@ -2661,4 +2090,3 @@ CREATE INDEX event_toc_index ON event USING btree (toc);
 CREATE INDEX event_action_index ON event USING hash (action);
 CREATE INDEX ship_location_index ON ship USING btree (location_x, location_y);
 CREATE INDEX planet_location_index ON planet USING btree (location_x, location_y);
-
